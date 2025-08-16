@@ -1,0 +1,598 @@
+# =====================================================
+# docker-compose.yml
+# Complete QBank infrastructure stack
+# =====================================================
+version: '3.9'
+
+services:
+  # ========== Databases ==========
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: qbank-postgres
+    environment:
+      POSTGRES_USER: qbank
+      POSTGRES_PASSWORD: qbank_secure_pwd
+      POSTGRES_DB: qbank
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - qbank-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qbank"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: qbank-redis
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - qbank-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========== Message Queue ==========
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: qbank-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - qbank-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: qbank-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "29092:29092"
+      - "9092:9092"
+    networks:
+      - qbank-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: qbank-kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8080:8080"
+    networks:
+      - qbank-network
+
+  # ========== Search & Analytics ==========
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: qbank-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - qbank-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.10
+    container_name: qbank-clickhouse
+    environment:
+      CLICKHOUSE_DB: qbank
+      CLICKHOUSE_USER: qbank
+      CLICKHOUSE_PASSWORD: qbank_secure_pwd
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - qbank-network
+
+  # ========== Application Services ==========
+  backend:
+    build:
+      context: ./qbank-backend
+      dockerfile: Dockerfile
+    container_name: qbank-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbank:qbank_secure_pwd@postgres:5432/qbank
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      CLICKHOUSE_URL: clickhouse://qbank:qbank_secure_pwd@clickhouse:9000/qbank
+      SECRET_KEY: ${SECRET_KEY:-change_me_in_production}
+      ENVIRONMENT: development
+    ports:
+      - "8000:8000"
+    networks:
+      - qbank-network
+    volumes:
+      - ./qbank-backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./qbank-backend
+      dockerfile: Dockerfile
+    container_name: qbank-worker
+    depends_on:
+      - backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbank:qbank_secure_pwd@postgres:5432/qbank
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    networks:
+      - qbank-network
+    volumes:
+      - ./qbank-backend:/app
+    command: python -m app.jobs.worker
+
+  celery-worker:
+    build:
+      context: ./qbank-backend
+      dockerfile: Dockerfile
+    container_name: qbank-celery-worker
+    depends_on:
+      - backend
+      - redis
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbank:qbank_secure_pwd@postgres:5432/qbank
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    networks:
+      - qbank-network
+    volumes:
+      - ./qbank-backend:/app
+    command: celery -A app.jobs.celery_app worker --loglevel=info
+
+  celery-beat:
+    build:
+      context: ./qbank-backend
+      dockerfile: Dockerfile
+    container_name: qbank-celery-beat
+    depends_on:
+      - celery-worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://qbank:qbank_secure_pwd@postgres:5432/qbank
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    networks:
+      - qbank-network
+    volumes:
+      - ./qbank-backend:/app
+    command: celery -A app.jobs.celery_app beat --loglevel=info
+
+  flower:
+    image: mher/flower:2.0
+    container_name: qbank-flower
+    depends_on:
+      - celery-worker
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      FLOWER_PORT: 5555
+    ports:
+      - "5555:5555"
+    networks:
+      - qbank-network
+
+  # ========== Frontend ==========
+  admin-ui:
+    build:
+      context: ./admin-ui
+      dockerfile: Dockerfile
+    container_name: qbank-admin-ui
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    networks:
+      - qbank-network
+    volumes:
+      - ./admin-ui:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+
+  # ========== Monitoring ==========
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: qbank-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    networks:
+      - qbank-network
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: qbank-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: redis-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - qbank-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: qbank-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    networks:
+      - qbank-network
+
+networks:
+  qbank-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+
+# =====================================================
+# qbank-backend/Dockerfile
+# Multi-stage build for backend
+# =====================================================
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+COPY requirements-dev.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application
+COPY . .
+
+# Create non-root user
+RUN useradd -m -u 1000 qbank && chown -R qbank:qbank /app
+USER qbank
+
+# Expose port
+EXPOSE 8000
+
+# Default command
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# =====================================================
+# admin-ui/Dockerfile
+# Next.js frontend build
+# =====================================================
+FROM node:18-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
+
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+ENV PORT 3000
+
+CMD ["node", "server.js"]
+
+# =====================================================
+# .env.example
+# Environment variables template
+# =====================================================
+# Application
+ENVIRONMENT=development
+SECRET_KEY=your-secret-key-here-change-in-production
+DEBUG=false
+
+# Database
+DATABASE_URL=postgresql+asyncpg://qbank:qbank_secure_pwd@localhost:5432/qbank
+DATABASE_POOL_SIZE=20
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+CACHE_TTL=3600
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=localhost:29092
+KAFKA_TOPIC_EVENTS=events.qbank
+KAFKA_TOPIC_ANALYTICS=analytics.qbank
+
+# Elasticsearch
+ELASTICSEARCH_URL=http://localhost:9200
+ELASTICSEARCH_INDEX_QUESTIONS=qbank-questions
+
+# ClickHouse
+CLICKHOUSE_URL=clickhouse://qbank:qbank_secure_pwd@localhost:9000/qbank
+
+# Authentication
+JWT_SECRET_KEY=jwt-secret-key-change-in-production
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+REFRESH_TOKEN_EXPIRE_DAYS=7
+
+# AWS (for S3 media storage)
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=qbank-media
+
+# OAuth Providers (optional)
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+
+# Email (for notifications)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+
+# Monitoring
+SENTRY_DSN=https://your-sentry-dsn
+NEW_RELIC_LICENSE_KEY=your-new-relic-key
+
+# ML Models
+OPENAI_API_KEY=your-openai-key
+HUGGINGFACE_TOKEN=your-huggingface-token
+
+# =====================================================
+# Makefile
+# Development and deployment commands
+# =====================================================
+.PHONY: help build up down logs clean test migrate
+
+help:
+	@echo "Available commands:"
+	@echo "  make build    - Build all Docker images"
+	@echo "  make up       - Start all services"
+	@echo "  make down     - Stop all services"
+	@echo "  make logs     - View logs"
+	@echo "  make clean    - Clean up volumes and images"
+	@echo "  make test     - Run tests"
+	@echo "  make migrate  - Run database migrations"
+
+build:
+	docker-compose build
+
+up:
+	docker-compose up -d
+	@echo "Services starting..."
+	@echo "Backend API: http://localhost:8000"
+	@echo "Admin UI: http://localhost:3000"
+	@echo "Kafka UI: http://localhost:8080"
+	@echo "Flower: http://localhost:5555"
+	@echo "Grafana: http://localhost:3001"
+	@echo "Jaeger: http://localhost:16686"
+
+down:
+	docker-compose down
+
+logs:
+	docker-compose logs -f
+
+clean:
+	docker-compose down -v
+	docker system prune -af
+
+test:
+	docker-compose exec backend pytest
+
+migrate:
+	docker-compose exec backend alembic upgrade head
+
+db-shell:
+	docker-compose exec postgres psql -U qbank -d qbank
+
+redis-cli:
+	docker-compose exec redis redis-cli
+
+# Development shortcuts
+dev-backend:
+	cd qbank-backend && uvicorn app.main:app --reload
+
+dev-frontend:
+	cd admin-ui && npm run dev
+
+dev-worker:
+	cd qbank-backend && python -m app.jobs.worker
+
+# Production deployment
+deploy-prod:
+	kubectl apply -f k8s/
+
+deploy-staging:
+	kubectl apply -f k8s/ --namespace=staging
+
+# =====================================================
+# k8s/deployment.yaml
+# Kubernetes deployment configuration
+# =====================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qbank-backend
+  labels:
+    app: qbank-backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: qbank-backend
+  template:
+    metadata:
+      labels:
+        app: qbank-backend
+    spec:
+      containers:
+      - name: backend
+        image: qbank/backend:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: qbank-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: qbank-secrets
+              key: redis-url
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qbank-backend
+spec:
+  selector:
+    app: qbank-backend
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: qbank-backend-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: qbank-backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
